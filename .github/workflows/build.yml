@@ -2,6 +2,14 @@ name: Build
 run-name: Build
 on: [push]
 jobs:
+  TestHidLayout:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Run the USB HID report descriptor tests
+        run: make -C components/usb-host/test_native test
+
   Build:
     runs-on: ubuntu-latest
     strategy:

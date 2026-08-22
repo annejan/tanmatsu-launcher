@@ -13,6 +13,8 @@
 #define HID_ITEM_TAG(prefix)  ((prefix) & 0xfc)
 
 #define HID_ITEM_INPUT          0x80
+#define HID_ITEM_OUTPUT         0x90
+#define HID_ITEM_FEATURE        0xb0
 #define HID_ITEM_COLLECTION     0xa0
 #define HID_ITEM_END_COLLECTION 0xc0
 #define HID_ITEM_USAGE_PAGE     0x04
@@ -248,10 +250,19 @@ bool hid_layout_parse(const uint8_t* report_descriptor, size_t length, hid_layou
                 usage_range = false;
                 break;
             }
-            default:
-                // Collections, output and feature items take up no space in an input report
+            case HID_ITEM_OUTPUT:
+            case HID_ITEM_FEATURE:
+            case HID_ITEM_COLLECTION:
+            case HID_ITEM_END_COLLECTION:
+                // These take up no space in an input report, but like every main item they
+                // do use up the usages named before them
                 usage_count = 0;
                 usage_range = false;
+                break;
+            default:
+                // Anything else is a global or local item that says nothing this parser wants.
+                // Local items live on until a main item consumes them, so they stay put: a unit
+                // or a physical range between a usage and its input item is perfectly normal.
                 break;
         }
     }
