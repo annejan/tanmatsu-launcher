@@ -3,6 +3,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include "bsp/input.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -26,6 +27,11 @@ typedef struct {
 
     /// Index of the first of four buttons that act as a d-pad, in the order up, right, down, left
     int dpad_first_button;
+
+    /// Navigation key per button, indexed by button number, BSP_INPUT_NAVIGATION_KEY_NONE to ignore one.
+    /// Without this the buttons are taken in the order the gamepad reports them.
+    const bsp_input_navigation_key_t* button_map;
+    size_t                            button_map_length;
 } hid_gamepad_quirk_t;
 
 /// @brief Look up the quirks of a gamepad, NULL when it needs none

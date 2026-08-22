@@ -47,6 +47,27 @@ static const char* TAG = "hid_gamepad";
 // buttons five through eight.
 static const uint8_t dualshock3_enable_reporting[] = {0x42, 0x0c, 0x00, 0x00};
 
+// Buttons of a DualShock 3, in the order it reports them
+static const bsp_input_navigation_key_t dualshock3_button_map[] = {
+    BSP_INPUT_NAVIGATION_KEY_SELECT,          // Select
+    BSP_INPUT_NAVIGATION_KEY_JOYSTICK_PRESS,  // Left stick
+    BSP_INPUT_NAVIGATION_KEY_JOYSTICK_PRESS,  // Right stick
+    BSP_INPUT_NAVIGATION_KEY_START,           // Start
+    BSP_INPUT_NAVIGATION_KEY_NONE,            // D-pad up
+    BSP_INPUT_NAVIGATION_KEY_NONE,            // D-pad right
+    BSP_INPUT_NAVIGATION_KEY_NONE,            // D-pad down
+    BSP_INPUT_NAVIGATION_KEY_NONE,            // D-pad left
+    BSP_INPUT_NAVIGATION_KEY_NONE,            // L2
+    BSP_INPUT_NAVIGATION_KEY_NONE,            // R2
+    BSP_INPUT_NAVIGATION_KEY_PGUP,            // L1
+    BSP_INPUT_NAVIGATION_KEY_PGDN,            // R1
+    BSP_INPUT_NAVIGATION_KEY_GAMEPAD_Y,       // Triangle
+    BSP_INPUT_NAVIGATION_KEY_GAMEPAD_B,       // Circle, cancels
+    BSP_INPUT_NAVIGATION_KEY_GAMEPAD_A,       // Cross, confirms
+    BSP_INPUT_NAVIGATION_KEY_GAMEPAD_X,       // Square
+    BSP_INPUT_NAVIGATION_KEY_HOME,            // PS button
+};
+
 static const hid_gamepad_quirk_t hid_gamepad_quirks[] = {
     {
         .vid                  = 0x054c,
@@ -56,6 +77,8 @@ static const hid_gamepad_quirk_t hid_gamepad_quirks[] = {
         .enable_report        = dualshock3_enable_reporting,
         .enable_report_length = sizeof(dualshock3_enable_reporting),
         .dpad_first_button    = 4,
+        .button_map           = dualshock3_button_map,
+        .button_map_length    = sizeof(dualshock3_button_map) / sizeof(dualshock3_button_map[0]),
     },
 };
 
@@ -86,11 +109,14 @@ typedef struct {
     uint16_t            button_count;
     bool                dpad_is_buttons;  // Four of the buttons are a d-pad rather than fire buttons
     uint16_t            dpad_first;       // Index of the first of those, they run up, right, down, left
+
+    const bsp_input_navigation_key_t* button_map;  // Navigation key per button, NULL to take them in order
+    size_t                            button_map_length;
 } hid_gamepad_layout_t;
 
 static hid_gamepad_layout_t layout;
 
-// Navigation keys the buttons map to, in the order the gamepad reports them
+// Navigation keys the buttons map to when a gamepad has no button map of its own
 static const bsp_input_navigation_key_t button_keys[] = {
     BSP_INPUT_NAVIGATION_KEY_GAMEPAD_A,
     BSP_INPUT_NAVIGATION_KEY_GAMEPAD_B,
@@ -102,8 +128,11 @@ static const bsp_input_navigation_key_t button_keys[] = {
 
 #define BUTTON_KEY_COUNT (sizeof(button_keys) / sizeof(button_keys[0]))
 
-// Everything a report can hold, as navigation keys: the four directions and the buttons above
-#define NAVIGATION_KEY_COUNT (4 + BUTTON_KEY_COUNT)
+// Buttons of one gamepad that can hold a navigation key, the rest is ignored
+#define MAX_BUTTON_KEYS 20
+
+// Everything a report turns into: the four directions followed by the buttons
+#define NAVIGATION_KEY_COUNT (4 + MAX_BUTTON_KEYS)
 
 static void inject_navigation(bsp_input_navigation_key_t key, bool state) {
     bsp_input_event_t event = {
@@ -314,6 +343,10 @@ bool hid_gamepad_connect(const uint8_t* report_descriptor, size_t length, uint16
         ESP_LOGI(TAG, "%s: buttons %d to %d are a d-pad", quirk->name, quirk->dpad_first_button + 1,
                  quirk->dpad_first_button + 4);
     }
+    if (quirk != NULL && quirk->button_map != NULL) {
+        layout.button_map        = quirk->button_map;
+        layout.button_map_length = quirk->button_map_length;
+    }
 
     ESP_LOGI(TAG, "Gamepad layout: report id %d, x %d, y %d, hat %d, %d buttons at %d", layout.report_id,
              layout.x.present ? layout.x.bit_offset : -1, layout.y.present ? layout.y.bit_offset : -1,
@@ -355,8 +388,14 @@ void hid_gamepad_handle_report(const uint8_t* data, int length) {
         length--;
     }
 
-    bool left = false, right = false, up = false, down = false;
-    bool buttons[BUTTON_KEY_COUNT] = {0};
+    bool                       left = false, right = false, up = false, down = false;
+    bsp_input_navigation_key_t keys[NAVIGATION_KEY_COUNT] = {
+        BSP_INPUT_NAVIGATION_KEY_LEFT,
+        BSP_INPUT_NAVIGATION_KEY_RIGHT,
+        BSP_INPUT_NAVIGATION_KEY_UP,
+        BSP_INPUT_NAVIGATION_KEY_DOWN,
+    };
+    bool states[NAVIGATION_KEY_COUNT] = {0};
 
     axis_directions(data, length, &layout.x, &left, &right);
     axis_directions(data, length, &layout.y, &up, &down);
@@ -370,7 +409,8 @@ void hid_gamepad_handle_report(const uint8_t* data, int length) {
         left        = left || (hat == 5 || hat == 6 || hat == 7);
     }
 
-    uint16_t button_key = 0;
+    size_t next_key = 4;
+    size_t unmapped = 0;
     for (uint16_t b = 0; b < layout.button_count; b++) {
         hid_gamepad_field_t field = layout.buttons;
         field.bit_offset += b;
@@ -394,24 +434,29 @@ void hid_gamepad_handle_report(const uint8_t* data, int length) {
             continue;
         }
 
-        // Gamepads disagree about which button is which, so they are taken in the order reported
-        if (button_key < BUTTON_KEY_COUNT) {
-            buttons[button_key++] = pressed;
+        bsp_input_navigation_key_t key;
+        if (layout.button_map != NULL) {
+            // The quirk table knows which button is which on this gamepad
+            key = b < layout.button_map_length ? layout.button_map[b] : BSP_INPUT_NAVIGATION_KEY_NONE;
+        } else {
+            // Gamepads disagree about which button is which, so they are taken in the order reported
+            key = unmapped < BUTTON_KEY_COUNT ? button_keys[unmapped] : BSP_INPUT_NAVIGATION_KEY_NONE;
+            unmapped++;
         }
+
+        if (key == BSP_INPUT_NAVIGATION_KEY_NONE || next_key >= NAVIGATION_KEY_COUNT) {
+            continue;
+        }
+
+        keys[next_key]   = key;
+        states[next_key] = pressed;
+        next_key++;
     }
 
-    bsp_input_navigation_key_t keys[NAVIGATION_KEY_COUNT] = {
-        BSP_INPUT_NAVIGATION_KEY_LEFT,
-        BSP_INPUT_NAVIGATION_KEY_RIGHT,
-        BSP_INPUT_NAVIGATION_KEY_UP,
-        BSP_INPUT_NAVIGATION_KEY_DOWN,
-    };
-    bool states[NAVIGATION_KEY_COUNT] = {left, right, up, down};
-
-    for (size_t i = 0; i < BUTTON_KEY_COUNT; i++) {
-        keys[4 + i]   = button_keys[i];
-        states[4 + i] = buttons[i];
-    }
+    states[0] = left;
+    states[1] = right;
+    states[2] = up;
+    states[3] = down;
 
     // Only send events on state changes, gamepads report their full state continuously
     static uint32_t prev_state = 0;
