@@ -1,15 +1,30 @@
-// USB HID mouse support: turns mouse buttons and the scroll wheel into BSP navigation events.
-// The BSP has no pointer event type, so cursor movement is only logged.
+// USB HID mouse support: turns mouse buttons, movement and the scroll wheel into BSP navigation
+// events. The BSP has no pointer event type, so movement steps through a menu rather than moving
+// a cursor around.
 
 #include <stddef.h>
+#include <string.h>
 #include "bsp/input.h"
 #include "esp_log.h"
-#include "hid_report.h"
+#include "hid_layout.h"
+#include "hid_mouse.h"
 
 static const char* TAG = "hid_mouse";
 
-// Limit for how many navigation events a single wheel report may generate
-#define SCROLL_STEP_LIMIT 8
+// Mouse counts to travel before movement steps one place. A mouse reports somewhere between
+// 800 and 1600 counts per inch, so this is roughly a quarter of an inch.
+#define MOVE_COUNTS_PER_STEP 300
+
+// Navigation keys the buttons map to, in the order the mouse reports them
+static const bsp_input_navigation_key_t button_keys[] = {
+    BSP_INPUT_NAVIGATION_KEY_RETURN,          // Left
+    BSP_INPUT_NAVIGATION_KEY_ESC,             // Right
+    BSP_INPUT_NAVIGATION_KEY_JOYSTICK_PRESS,  // Middle
+};
+
+#define BUTTON_KEY_COUNT (sizeof(button_keys) / sizeof(button_keys[0]))
+
+static hid_layout_t layout;
 
 static void inject_navigation(bsp_input_navigation_key_t key, bool state) {
     bsp_input_event_t event = {
@@ -26,48 +41,94 @@ static void inject_navigation_press(bsp_input_navigation_key_t key) {
     inject_navigation(key, false);
 }
 
+/// @brief Add a movement to a travelled distance, starting over when it turns around
+///
+/// Starting over on a turn keeps a step in the other direction from having to undo everything
+/// that was travelled one way first.
+static int accumulate(int travelled, int movement) {
+    return (travelled > 0) == (movement > 0) ? travelled + movement : movement;
+}
+
+/// @brief Step a navigation key once per whole unit of travel
+static void step(int* travelled, int unit, bsp_input_navigation_key_t forward,
+                 bsp_input_navigation_key_t backward) {
+    while (*travelled >= unit) {
+        *travelled -= unit;
+        inject_navigation_press(forward);
+    }
+    while (*travelled <= -unit) {
+        *travelled += unit;
+        inject_navigation_press(backward);
+    }
+}
+
+void hid_mouse_disconnect(void) {
+    memset(&layout, 0, sizeof(layout));
+}
+
+bool hid_mouse_connect(const uint8_t* report_descriptor, size_t length) {
+    if (!hid_layout_parse(report_descriptor, length, &layout)) {
+        ESP_LOGW(TAG, "Nothing usable in the report descriptor, ignoring this mouse");
+        return false;
+    }
+
+    ESP_LOGI(TAG, "Mouse layout: report id %d, x %d, y %d, wheel %d, %d buttons at %d", layout.report_id,
+             layout.x.present ? layout.x.bit_offset : -1, layout.y.present ? layout.y.bit_offset : -1,
+             layout.wheel.present ? layout.wheel.bit_offset : -1, layout.button_count,
+             layout.buttons.present ? layout.buttons.bit_offset : -1);
+
+    return true;
+}
+
 void hid_mouse_handle_report(const uint8_t* data, int length) {
-    hid_mouse_report_t report = hid_parse_mouse_report(data, length);
+    static uint32_t prev_buttons = 0;
+    static int      travelled_x  = 0;
+    static int      travelled_y  = 0;
 
-    static uint8_t prev_buttons = 0;
-    static int     x_pos        = 0;
-    static int     y_pos        = 0;
+    // A plain wheel reports one count per detent, a wheel with a resolution multiplier reports
+    // eight or more. Take the largest count seen so far as one detent, so the first turn of an
+    // unknown wheel moves one place and the wheel calibrates itself from there.
+    static int detent    = 1;
+    static int scrolled  = 0;
 
-    const struct {
-        uint8_t                    mask;
-        bsp_input_navigation_key_t key;
-    } buttons[] = {
-        {0x01, BSP_INPUT_NAVIGATION_KEY_RETURN},
-        {0x02, BSP_INPUT_NAVIGATION_KEY_ESC},
-        {0x04, BSP_INPUT_NAVIGATION_KEY_JOYSTICK_PRESS},
-    };
+    if (!layout.valid || !hid_layout_strip_report_id(&layout, &data, &length)) {
+        return;
+    }
 
-    for (size_t i = 0; i < sizeof(buttons) / sizeof(buttons[0]); i++) {
-        bool was = prev_buttons & buttons[i].mask;
-        bool now = report.buttons.val & buttons[i].mask;
-        if (was != now) {
-            inject_navigation(buttons[i].key, now);
+    uint32_t pressed = 0;
+    for (uint16_t b = 0; b < layout.button_count && b < BUTTON_KEY_COUNT; b++) {
+        if (hid_layout_read_button(data, length, &layout, b)) {
+            pressed |= 1u << b;
         }
     }
-    prev_buttons = report.buttons.val;
 
-    // Wheel up scrolls up, wheel down scrolls down
-    int steps = report.scroll;
-    if (steps > SCROLL_STEP_LIMIT) {
-        steps = SCROLL_STEP_LIMIT;
+    for (uint16_t b = 0; b < BUTTON_KEY_COUNT; b++) {
+        bool was = prev_buttons & (1u << b);
+        bool now = pressed & (1u << b);
+        if (was != now) {
+            inject_navigation(button_keys[b], now);
+        }
     }
-    if (steps < -SCROLL_STEP_LIMIT) {
-        steps = -SCROLL_STEP_LIMIT;
-    }
-    for (int i = 0; i < steps; i++) {
-        inject_navigation_press(BSP_INPUT_NAVIGATION_KEY_UP);
-    }
-    for (int i = 0; i > steps; i--) {
-        inject_navigation_press(BSP_INPUT_NAVIGATION_KEY_DOWN);
-    }
+    prev_buttons = pressed;
 
-    x_pos += report.x_displacement;
-    y_pos += report.y_displacement;
-    ESP_LOGD(TAG, "X: %06d Y: %06d |%c|%c|%c| scroll: %d tilt: %d", x_pos, y_pos, report.buttons.button1 ? 'o' : ' ',
-             report.buttons.button3 ? 'o' : ' ', report.buttons.button2 ? 'o' : ' ', report.scroll, report.tilt);
+    int scroll = layout.wheel.present ? hid_layout_read(data, length, &layout.wheel) : 0;
+    int turned = scroll < 0 ? -scroll : scroll;
+    if (turned > detent) {
+        detent   = turned;
+        scrolled = 0;
+    }
+    scrolled = accumulate(scrolled, scroll);
+    step(&scrolled, detent, BSP_INPUT_NAVIGATION_KEY_UP, BSP_INPUT_NAVIGATION_KEY_DOWN);
+
+    int moved_x = layout.x.present ? hid_layout_read(data, length, &layout.x) : 0;
+    int moved_y = layout.y.present ? hid_layout_read(data, length, &layout.y) : 0;
+
+    travelled_x = accumulate(travelled_x, moved_x);
+    travelled_y = accumulate(travelled_y, moved_y);
+
+    step(&travelled_x, MOVE_COUNTS_PER_STEP, BSP_INPUT_NAVIGATION_KEY_RIGHT, BSP_INPUT_NAVIGATION_KEY_LEFT);
+    step(&travelled_y, MOVE_COUNTS_PER_STEP, BSP_INPUT_NAVIGATION_KEY_DOWN, BSP_INPUT_NAVIGATION_KEY_UP);
+
+    ESP_LOGD(TAG, "buttons %02X, moved %d %d, scrolled %d of %d per detent", (unsigned)pressed, moved_x, moved_y,
+             scroll, detent);
 }

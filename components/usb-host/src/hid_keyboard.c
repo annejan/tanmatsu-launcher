@@ -5,7 +5,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "hid_gamepad.h"
-#include "hid_report.h"
+#include "hid_mouse.h"
 #include "usb/hid_host.h"
 #include "usb/hid_usage_keyboard.h"
 #include "usb/usb_host.h"
@@ -612,6 +612,8 @@ void hid_host_interface_callback(hid_host_device_handle_t hid_device_handle, con
             ESP_LOGI(TAG, "HID Device, protocol '%s' DISCONNECTED", hid_proto_name_str[dev_params.proto]);
             if (HID_PROTOCOL_NONE == dev_params.proto) {
                 hid_gamepad_disconnect();
+            } else if (HID_PROTOCOL_MOUSE == dev_params.proto) {
+                hid_mouse_disconnect();
             }
             ESP_ERROR_CHECK(hid_host_device_close(hid_device_handle));
             break;
@@ -681,6 +683,12 @@ void hid_host_device_event(hid_host_device_handle_t hid_device_handle, const hid
                     // Report protocol so mice report their scroll wheel as well
                     hid_class_request_set_protocol(hid_device_handle, HID_REPORT_PROTOCOL_REPORT);
                 }
+            }
+            if (HID_PROTOCOL_MOUSE == dev_params.proto) {
+                // The report layout differs per mouse, so learn it from the report descriptor
+                size_t   report_desc_len = 0;
+                uint8_t* report_desc     = hid_host_get_report_descriptor(hid_device_handle, &report_desc_len);
+                hid_mouse_connect(report_desc, report_desc_len);
             }
             if (HID_PROTOCOL_NONE == dev_params.proto) {
                 // The report layout differs per gamepad, so learn it from the report descriptor
