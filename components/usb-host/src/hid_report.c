@@ -1,4 +1,4 @@
-// Parsers for raw USB HID mouse and gamepad input reports.
+// Parser for raw USB HID mouse input reports.
 // Ported from https://github.com/annejan/konsool-HID
 
 #include "hid_report.h"
@@ -55,53 +55,6 @@ hid_mouse_report_t hid_parse_mouse_report(const uint8_t* data, int length) {
         report.scroll         = (int8_t)data[7];
         report.tilt           = (int8_t)data[8];
     }
-
-    return report;
-}
-
-hid_gamepad_report_t hid_parse_gamepad_report(const uint8_t* data, int length) {
-    hid_gamepad_report_t report = {0};
-
-    if (length < 10) {
-        return report;
-    }
-
-    report.report_id = data[0];
-
-    uint8_t hat = data[1];
-    uint8_t b1  = data[2];
-    uint8_t b2  = data[3];
-
-    // Hat switch, eight directions clockwise starting at up
-    report.buttons.up    = (hat == 0x00 || hat == 0x01 || hat == 0x07);
-    report.buttons.right = (hat == 0x01 || hat == 0x02 || hat == 0x03);
-    report.buttons.down  = (hat == 0x03 || hat == 0x04 || hat == 0x05);
-    report.buttons.left  = (hat == 0x05 || hat == 0x06 || hat == 0x07);
-
-    report.buttons.a = (b2 >> 6) & 1;
-    report.buttons.b = (b2 >> 5) & 1;
-    report.buttons.x = (b2 >> 4) & 1;
-    report.buttons.y = (b2 >> 3) & 1;
-
-    report.buttons.l1 = (b2 >> 0) & 1;
-    report.buttons.r1 = (b1 >> 7) & 1;
-    report.buttons.l2 = (b2 >> 2) & 1;
-    report.buttons.r2 = (b2 >> 1) & 1;
-    report.buttons.l3 = (b1 >> 2) & 1;
-    report.buttons.r3 = (b1 >> 3) & 1;
-
-    report.buttons.l4     = (b1 >> 1) & 1;
-    report.buttons.r4     = (b1 >> 0) & 1;
-    report.buttons.select = (b1 >> 6) & 1;
-    report.buttons.start  = (b1 >> 5) & 1;
-    report.buttons.home   = (b1 >> 4) & 1;
-
-    report.lx = data[4];
-    report.ly = data[5];
-    report.rx = data[6];
-    report.ry = data[7];
-    report.lt = data[8];
-    report.rt = data[9];
 
     return report;
 }

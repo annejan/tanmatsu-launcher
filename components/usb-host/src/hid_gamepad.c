@@ -1,14 +1,109 @@
-// USB HID gamepad support: turns buttons, hat switch and the left stick into BSP navigation events.
+// USB HID gamepad support: turns directions and buttons into BSP navigation events.
+//
+// Gamepads do not agree on a report layout: one pad puts its stick in a hat switch, the next
+// one reports X and Y and never touches the hat, and a DualShock 3 has its d-pad in its
+// buttons. Rather than guess, the report descriptor is parsed on connect to find where X, Y,
+// the hat switch and the buttons live, and reports are decoded using those bit offsets.
 
-#include <stddef.h>
+#include "hid_gamepad.h"
+#include <string.h>
 #include "bsp/input.h"
 #include "esp_log.h"
-#include "hid_report.h"
 
 static const char* TAG = "hid_gamepad";
 
-// Distance from the center (0x80) before an analog stick counts as a direction
-#define STICK_DEADZONE 48
+// Report descriptor item prefix, see HID 1.11 section 6.2.2.2
+#define HID_ITEM_SIZE(prefix) ((prefix) & 0x03)
+#define HID_ITEM_TAG(prefix)  ((prefix) & 0xfc)
+
+#define HID_ITEM_INPUT          0x80
+#define HID_ITEM_COLLECTION     0xa0
+#define HID_ITEM_END_COLLECTION 0xc0
+#define HID_ITEM_USAGE_PAGE     0x04
+#define HID_ITEM_LOGICAL_MIN    0x14
+#define HID_ITEM_LOGICAL_MAX    0x24
+#define HID_ITEM_REPORT_SIZE    0x74
+#define HID_ITEM_REPORT_ID      0x84
+#define HID_ITEM_REPORT_COUNT   0x94
+#define HID_ITEM_USAGE          0x08
+#define HID_ITEM_USAGE_MIN      0x18
+#define HID_ITEM_USAGE_MAX      0x28
+
+// Input item is constant instead of data, so padding rather than a control
+#define HID_INPUT_CONSTANT 0x01
+
+#define HID_USAGE_PAGE_GENERIC_DESKTOP 0x01
+#define HID_USAGE_PAGE_BUTTON          0x09
+
+#define HID_USAGE_X          0x30
+#define HID_USAGE_Y          0x31
+#define HID_USAGE_HAT_SWITCH 0x39
+
+// Most usages one input item can name before the rest is ignored
+#define MAX_LOCAL_USAGES 32
+
+// A DualShock 3 enumerates and hands out its report descriptor, but stays silent until
+// the host asks it to start reporting. It has no hat switch either, its d-pad sits in
+// buttons five through eight.
+static const uint8_t dualshock3_enable_reporting[] = {0x42, 0x0c, 0x00, 0x00};
+
+static const hid_gamepad_quirk_t hid_gamepad_quirks[] = {
+    {
+        .vid                  = 0x054c,
+        .pid                  = 0x0268,
+        .name                 = "DualShock 3",
+        .enable_report_id     = 0xf4,
+        .enable_report        = dualshock3_enable_reporting,
+        .enable_report_length = sizeof(dualshock3_enable_reporting),
+        .dpad_first_button    = 4,
+    },
+};
+
+const hid_gamepad_quirk_t* hid_gamepad_find_quirk(uint16_t vid, uint16_t pid) {
+    for (size_t i = 0; i < sizeof(hid_gamepad_quirks) / sizeof(hid_gamepad_quirks[0]); i++) {
+        if (hid_gamepad_quirks[i].vid == vid && hid_gamepad_quirks[i].pid == pid) {
+            return &hid_gamepad_quirks[i];
+        }
+    }
+    return NULL;
+}
+
+typedef struct {
+    bool     present;
+    uint16_t bit_offset;
+    uint8_t  bit_size;
+    int32_t  logical_min;
+    int32_t  logical_max;
+} hid_gamepad_field_t;
+
+typedef struct {
+    bool                valid;
+    uint8_t             report_id;  // Zero when the reports carry no report ID
+    hid_gamepad_field_t x;
+    hid_gamepad_field_t y;
+    hid_gamepad_field_t hat;
+    hid_gamepad_field_t buttons;  // bit_size is one, the count is in button_count
+    uint16_t            button_count;
+    bool                dpad_is_buttons;  // Four of the buttons are a d-pad rather than fire buttons
+    uint16_t            dpad_first;       // Index of the first of those, they run up, right, down, left
+} hid_gamepad_layout_t;
+
+static hid_gamepad_layout_t layout;
+
+// Navigation keys the buttons map to, in the order the gamepad reports them
+static const bsp_input_navigation_key_t button_keys[] = {
+    BSP_INPUT_NAVIGATION_KEY_GAMEPAD_A,
+    BSP_INPUT_NAVIGATION_KEY_GAMEPAD_B,
+    BSP_INPUT_NAVIGATION_KEY_GAMEPAD_X,
+    BSP_INPUT_NAVIGATION_KEY_GAMEPAD_Y,
+    BSP_INPUT_NAVIGATION_KEY_START,
+    BSP_INPUT_NAVIGATION_KEY_SELECT,
+};
+
+#define BUTTON_KEY_COUNT (sizeof(button_keys) / sizeof(button_keys[0]))
+
+// Everything a report can hold, as navigation keys: the four directions and the buttons above
+#define NAVIGATION_KEY_COUNT (4 + BUTTON_KEY_COUNT)
 
 static void inject_navigation(bsp_input_navigation_key_t key, bool state) {
     bsp_input_event_t event = {
@@ -20,52 +115,316 @@ static void inject_navigation(bsp_input_navigation_key_t key, bool state) {
     bsp_input_inject_event(&event);
 }
 
-void hid_gamepad_handle_report(const uint8_t* data, int length) {
-    if (length < 10) {
-        ESP_LOGD(TAG, "Ignoring %d byte report", length);
+/// @brief Read the data of a report descriptor item, unsigned
+static uint32_t item_data(const uint8_t* item, uint8_t size) {
+    uint32_t value = 0;
+    for (uint8_t i = 0; i < size; i++) {
+        value |= (uint32_t)item[i] << (8 * i);
+    }
+    return value;
+}
+
+/// @brief Read the data of a report descriptor item, sign extended
+static int32_t item_data_signed(const uint8_t* item, uint8_t size) {
+    uint32_t value = item_data(item, size);
+    if (size > 0 && size < 4 && (value & (1u << (8 * size - 1)))) {
+        value |= 0xffffffffu << (8 * size);
+    }
+    return (int32_t)value;
+}
+
+/// @brief Pull a field out of an input report
+static int32_t extract_field(const uint8_t* data, int length, const hid_gamepad_field_t* field) {
+    uint32_t value = 0;
+
+    for (uint8_t i = 0; i < field->bit_size; i++) {
+        uint16_t bit = field->bit_offset + i;
+        if (bit / 8 >= (uint16_t)length) {
+            break;
+        }
+        if (data[bit / 8] & (1 << (bit % 8))) {
+            value |= 1u << i;
+        }
+    }
+
+    // Fields with a negative logical minimum hold signed values
+    if (field->logical_min < 0 && field->bit_size < 32 && (value & (1u << (field->bit_size - 1)))) {
+        value |= 0xffffffffu << field->bit_size;
+    }
+
+    return (int32_t)value;
+}
+
+void hid_gamepad_disconnect(void) {
+    memset(&layout, 0, sizeof(layout));
+}
+
+bool hid_gamepad_connect(const uint8_t* report_descriptor, size_t length, uint16_t vid, uint16_t pid) {
+    hid_gamepad_disconnect();
+
+    if (report_descriptor == NULL) {
+        return false;
+    }
+
+    uint16_t usage_page   = 0;
+    int32_t  logical_min  = 0;
+    int32_t  logical_max  = 0;
+    uint8_t  report_size  = 0;
+    uint16_t report_count = 0;
+    uint8_t  report_id    = 0;
+
+    uint16_t usages[MAX_LOCAL_USAGES];
+    uint8_t  usage_count = 0;
+    uint32_t usage_min   = 0;
+    uint32_t usage_max   = 0;
+    bool     usage_range = false;
+
+    // Bit offset within the report the next input item starts at
+    uint16_t bit_offset = 0;
+
+    size_t i = 0;
+    while (i < length) {
+        uint8_t prefix = report_descriptor[i];
+        uint8_t size   = HID_ITEM_SIZE(prefix);
+        if (size == 3) {
+            size = 4;  // A size field of three means four bytes
+        }
+        const uint8_t* data = &report_descriptor[i + 1];
+        if (i + 1 + size > length) {
+            break;
+        }
+        i += 1 + size;
+
+        switch (HID_ITEM_TAG(prefix)) {
+            case HID_ITEM_USAGE_PAGE:
+                usage_page = (uint16_t)item_data(data, size);
+                break;
+            case HID_ITEM_LOGICAL_MIN:
+                logical_min = item_data_signed(data, size);
+                break;
+            case HID_ITEM_LOGICAL_MAX:
+                // Only signed when the minimum is, otherwise 0xff means 255 rather than -1
+                logical_max = logical_min < 0 ? item_data_signed(data, size) : (int32_t)item_data(data, size);
+                break;
+            case HID_ITEM_REPORT_SIZE:
+                report_size = (uint8_t)item_data(data, size);
+                break;
+            case HID_ITEM_REPORT_COUNT:
+                report_count = (uint16_t)item_data(data, size);
+                break;
+            case HID_ITEM_REPORT_ID:
+                // Every report ID starts its own report, only the first one is looked at
+                if (report_id == 0) {
+                    report_id  = (uint8_t)item_data(data, size);
+                    bit_offset = 0;
+                } else {
+                    // A second report ID, stop before mixing offsets of different reports
+                    i = length;
+                }
+                break;
+            case HID_ITEM_USAGE:
+                if (usage_count < MAX_LOCAL_USAGES) {
+                    usages[usage_count++] = (uint16_t)item_data(data, size);
+                }
+                break;
+            case HID_ITEM_USAGE_MIN:
+                usage_min   = item_data(data, size);
+                usage_range = true;
+                break;
+            case HID_ITEM_USAGE_MAX:
+                usage_max   = item_data(data, size);
+                usage_range = true;
+                break;
+            case HID_ITEM_INPUT: {
+                uint32_t flags = item_data(data, size);
+
+                if (!(flags & HID_INPUT_CONSTANT)) {
+                    if (usage_page == HID_USAGE_PAGE_BUTTON && !layout.buttons.present) {
+                        layout.buttons.present     = true;
+                        layout.buttons.bit_offset  = bit_offset;
+                        layout.buttons.bit_size    = 1;
+                        layout.buttons.logical_min = 0;
+                        layout.buttons.logical_max = 1;
+                        layout.button_count        = report_count;
+                        if (usage_range && usage_max >= usage_min) {
+                            uint32_t named = usage_max - usage_min + 1;
+                            if (named < layout.button_count) {
+                                layout.button_count = (uint16_t)named;
+                            }
+                        }
+                    } else if (usage_page == HID_USAGE_PAGE_GENERIC_DESKTOP) {
+                        for (uint16_t f = 0; f < report_count && f < usage_count; f++) {
+                            hid_gamepad_field_t* field = NULL;
+                            switch (usages[f]) {
+                                case HID_USAGE_X:
+                                    field = &layout.x;
+                                    break;
+                                case HID_USAGE_Y:
+                                    field = &layout.y;
+                                    break;
+                                case HID_USAGE_HAT_SWITCH:
+                                    field = &layout.hat;
+                                    break;
+                                default:
+                                    break;
+                            }
+                            if (field != NULL && !field->present) {
+                                field->present     = true;
+                                field->bit_offset  = bit_offset + f * report_size;
+                                field->bit_size    = report_size;
+                                field->logical_min = logical_min;
+                                field->logical_max = logical_max;
+                            }
+                        }
+                    }
+                }
+
+                bit_offset += (uint16_t)(report_size * report_count);
+                usage_count = 0;
+                usage_range = false;
+                break;
+            }
+            case HID_ITEM_COLLECTION:
+            case HID_ITEM_END_COLLECTION:
+                usage_count = 0;
+                usage_range = false;
+                break;
+            default:
+                // Output and feature items do not take up space in an input report
+                usage_count = 0;
+                usage_range = false;
+                break;
+        }
+    }
+
+    if (!layout.x.present && !layout.y.present && !layout.hat.present) {
+        ESP_LOGW(TAG, "No usable directions in the report descriptor, ignoring this device");
+        hid_gamepad_disconnect();
+        return false;
+    }
+
+    layout.report_id = report_id;
+    layout.valid     = true;
+
+    const hid_gamepad_quirk_t* quirk = hid_gamepad_find_quirk(vid, pid);
+    if (quirk != NULL && quirk->dpad_first_button != HID_GAMEPAD_NO_DPAD_BUTTONS && layout.buttons.present &&
+        layout.button_count > quirk->dpad_first_button + 3) {
+        layout.dpad_is_buttons = true;
+        layout.dpad_first      = (uint16_t)quirk->dpad_first_button;
+        ESP_LOGI(TAG, "%s: buttons %d to %d are a d-pad", quirk->name, quirk->dpad_first_button + 1,
+                 quirk->dpad_first_button + 4);
+    }
+
+    ESP_LOGI(TAG, "Gamepad layout: report id %d, x %d, y %d, hat %d, %d buttons at %d", layout.report_id,
+             layout.x.present ? layout.x.bit_offset : -1, layout.y.present ? layout.y.bit_offset : -1,
+             layout.hat.present ? layout.hat.bit_offset : -1, layout.button_count,
+             layout.buttons.present ? layout.buttons.bit_offset : -1);
+
+    return true;
+}
+
+/// @brief Whether an axis is pushed far enough from its center to count as a direction
+static void axis_directions(const uint8_t* data, int length, const hid_gamepad_field_t* field, bool* low, bool* high) {
+    if (!field->present || field->logical_max <= field->logical_min) {
         return;
     }
 
-    hid_gamepad_report_t report = hid_parse_gamepad_report(data, length);
+    int32_t value  = extract_field(data, length, field);
+    int32_t center = (field->logical_min + field->logical_max) / 2;
+    int32_t margin = (field->logical_max - field->logical_min) / 4;
 
-    // The left stick doubles as a d-pad
-    bool left  = report.buttons.left || report.lx < (0x80 - STICK_DEADZONE);
-    bool right = report.buttons.right || report.lx > (0x80 + STICK_DEADZONE);
-    bool up    = report.buttons.up || report.ly < (0x80 - STICK_DEADZONE);
-    bool down  = report.buttons.down || report.ly > (0x80 + STICK_DEADZONE);
+    if (value < center - margin) {
+        *low = true;
+    }
+    if (value > center + margin) {
+        *high = true;
+    }
+}
 
-    const struct {
-        bool                       state;
-        bsp_input_navigation_key_t key;
-    } keys[] = {
-        {left, BSP_INPUT_NAVIGATION_KEY_LEFT},
-        {right, BSP_INPUT_NAVIGATION_KEY_RIGHT},
-        {up, BSP_INPUT_NAVIGATION_KEY_UP},
-        {down, BSP_INPUT_NAVIGATION_KEY_DOWN},
-        {report.buttons.a, BSP_INPUT_NAVIGATION_KEY_GAMEPAD_A},
-        {report.buttons.b, BSP_INPUT_NAVIGATION_KEY_GAMEPAD_B},
-        {report.buttons.x, BSP_INPUT_NAVIGATION_KEY_GAMEPAD_X},
-        {report.buttons.y, BSP_INPUT_NAVIGATION_KEY_GAMEPAD_Y},
-        {report.buttons.start, BSP_INPUT_NAVIGATION_KEY_START},
-        {report.buttons.select, BSP_INPUT_NAVIGATION_KEY_SELECT},
-        {report.buttons.home, BSP_INPUT_NAVIGATION_KEY_HOME},
-        {report.buttons.l1, BSP_INPUT_NAVIGATION_KEY_PGUP},
-        {report.buttons.r1, BSP_INPUT_NAVIGATION_KEY_PGDN},
-        {report.buttons.l3 || report.buttons.r3, BSP_INPUT_NAVIGATION_KEY_JOYSTICK_PRESS},
+void hid_gamepad_handle_report(const uint8_t* data, int length) {
+    if (!layout.valid || length < 1) {
+        return;
+    }
+
+    if (layout.report_id != 0) {
+        if (data[0] != layout.report_id) {
+            return;
+        }
+        // The report ID is not part of the bit offsets in the descriptor
+        data++;
+        length--;
+    }
+
+    bool left = false, right = false, up = false, down = false;
+    bool buttons[BUTTON_KEY_COUNT] = {0};
+
+    axis_directions(data, length, &layout.x, &left, &right);
+    axis_directions(data, length, &layout.y, &up, &down);
+
+    if (layout.hat.present) {
+        // Eight directions clockwise starting at up, anything else means centered
+        int32_t hat = extract_field(data, length, &layout.hat) - layout.hat.logical_min;
+        up          = up || (hat == 0 || hat == 1 || hat == 7);
+        right       = right || (hat == 1 || hat == 2 || hat == 3);
+        down        = down || (hat == 3 || hat == 4 || hat == 5);
+        left        = left || (hat == 5 || hat == 6 || hat == 7);
+    }
+
+    uint16_t button_key = 0;
+    for (uint16_t b = 0; b < layout.button_count; b++) {
+        hid_gamepad_field_t field = layout.buttons;
+        field.bit_offset += b;
+        bool pressed = extract_field(data, length, &field);
+
+        if (layout.dpad_is_buttons && b >= layout.dpad_first && b < layout.dpad_first + 4) {
+            switch (b - layout.dpad_first) {
+                case 0:
+                    up = up || pressed;
+                    break;
+                case 1:
+                    right = right || pressed;
+                    break;
+                case 2:
+                    down = down || pressed;
+                    break;
+                default:
+                    left = left || pressed;
+                    break;
+            }
+            continue;
+        }
+
+        // Gamepads disagree about which button is which, so they are taken in the order reported
+        if (button_key < BUTTON_KEY_COUNT) {
+            buttons[button_key++] = pressed;
+        }
+    }
+
+    bsp_input_navigation_key_t keys[NAVIGATION_KEY_COUNT] = {
+        BSP_INPUT_NAVIGATION_KEY_LEFT,
+        BSP_INPUT_NAVIGATION_KEY_RIGHT,
+        BSP_INPUT_NAVIGATION_KEY_UP,
+        BSP_INPUT_NAVIGATION_KEY_DOWN,
     };
+    bool states[NAVIGATION_KEY_COUNT] = {left, right, up, down};
+
+    for (size_t i = 0; i < BUTTON_KEY_COUNT; i++) {
+        keys[4 + i]   = button_keys[i];
+        states[4 + i] = buttons[i];
+    }
 
     // Only send events on state changes, gamepads report their full state continuously
     static uint32_t prev_state = 0;
     uint32_t        state      = 0;
 
-    for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
-        if (keys[i].state) {
+    for (size_t i = 0; i < NAVIGATION_KEY_COUNT; i++) {
+        if (states[i]) {
             state |= (1 << i);
         }
         bool was = prev_state & (1 << i);
-        if (was != keys[i].state) {
-            inject_navigation(keys[i].key, keys[i].state);
-            ESP_LOGD(TAG, "Navigation key %d = %d", keys[i].key, keys[i].state);
+        if (was != states[i]) {
+            inject_navigation(keys[i], states[i]);
+            ESP_LOGD(TAG, "Navigation key %d = %d", keys[i], states[i]);
         }
     }
 
