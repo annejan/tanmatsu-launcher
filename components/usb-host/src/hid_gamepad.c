@@ -116,7 +116,9 @@ bool hid_gamepad_connect(const uint8_t* report_descriptor, size_t length, uint16
         return false;
     }
 
-    if (!layout.layout.x.present && !layout.layout.y.present && !layout.layout.hat.present) {
+    bool absolute_axes = (layout.layout.x.present && !layout.layout.x.relative) ||
+                         (layout.layout.y.present && !layout.layout.y.relative);
+    if (!absolute_axes && !layout.layout.hat.present) {
         ESP_LOGW(TAG, "No usable directions in the report descriptor, ignoring this device");
         hid_gamepad_disconnect();
         return false;

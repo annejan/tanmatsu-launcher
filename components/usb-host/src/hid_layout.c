@@ -30,6 +30,9 @@
 // Input item is constant instead of data, so padding rather than a control
 #define HID_INPUT_CONSTANT 0x01
 
+// Input item reports a change rather than a position, as a mouse does
+#define HID_INPUT_RELATIVE 0x04
+
 #define HID_USAGE_PAGE_GENERIC_DESKTOP 0x01
 #define HID_USAGE_PAGE_BUTTON          0x09
 
@@ -102,7 +105,7 @@ bool hid_layout_strip_report_id(const hid_layout_t* layout, const uint8_t** data
 }
 
 void hid_layout_axis_directions(const uint8_t* data, int length, const hid_field_t* field, bool* low, bool* high) {
-    if (!field->present || field->logical_max <= field->logical_min) {
+    if (!field->present || field->relative || field->logical_max <= field->logical_min) {
         return;
     }
 
@@ -236,6 +239,7 @@ bool hid_layout_parse(const uint8_t* report_descriptor, size_t length, hid_layou
                             }
                             if (field != NULL && !field->present) {
                                 field->present     = true;
+                                field->relative    = (flags & HID_INPUT_RELATIVE) != 0;
                                 field->bit_offset  = bit_offset + f * report_size;
                                 field->bit_size    = report_size;
                                 field->logical_min = logical_min;

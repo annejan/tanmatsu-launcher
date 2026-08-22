@@ -11,6 +11,7 @@ extern "C" {
 /// @brief One control within an input report
 typedef struct {
     bool     present;
+    bool     relative;  // Reports a change rather than a position, as a mouse does
     uint16_t bit_offset;
     uint8_t  bit_size;
     int32_t  logical_min;

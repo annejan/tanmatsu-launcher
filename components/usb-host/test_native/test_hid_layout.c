@@ -28,6 +28,10 @@ static void test_logitech_m705(void) {
     check_field(&layout.y, 28, 12);
     check_field(&layout.wheel, 40, 8);
 
+    // A mouse reports how far it moved, not where it is
+    assert(layout.x.relative);
+    assert(layout.y.relative);
+
     // Twelve bit axes are signed, and the report ID has to come off first
     const uint8_t* data   = mouse1_reports[1];
     int            length = 8;
@@ -118,6 +122,10 @@ static void test_stadia(void) {
     assert(layout.button_count == 15);
     check_field(&layout.x, 24, 8);
     check_field(&layout.y, 32, 8);
+
+    // A stick reports where it is, which is what makes it usable as a direction
+    assert(!layout.x.relative);
+    assert(!layout.y.relative);
 
     bool           left = false, right = false, up = false, down = false;
     const uint8_t* data   = pad1_reports[3];
