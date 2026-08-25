@@ -4,7 +4,7 @@ dependencies:
   idf: ">=5.3"
   badgeteam/hid-host:
     git: https://github.com/badgeteam/esp32-component-hid-host.git
-    version: "v0.1.0"
+    version: "v0.3.0"
     rules:
       - if: target == esp32p4 || target == esp32s31
   usb_host_hid:

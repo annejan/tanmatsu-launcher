@@ -5,6 +5,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "hid_gamepad.h"
+#include "hid_gamepad_nav.h"
 #include "hid_mouse.h"
 #include "usb/hid_host.h"
 #include "usb/hid_usage_keyboard.h"
