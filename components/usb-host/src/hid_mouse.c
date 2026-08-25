@@ -26,6 +26,18 @@ static const bsp_input_navigation_key_t button_keys[] = {
 
 static hid_layout_t layout;
 
+// What the last report said, so only changes are sent on, and how far the mouse has travelled
+// since it last stepped. All of it belongs to the mouse that is plugged in now.
+static uint32_t prev_buttons;
+static int      travelled_x;
+static int      travelled_y;
+
+// A plain wheel reports one count per detent, a wheel with a resolution multiplier reports
+// eight or more. The largest count seen so far is taken as one detent, so the first turn of an
+// unknown wheel moves one place and the wheel calibrates itself from there.
+static int detent = 1;
+static int scrolled;
+
 static void inject_navigation(bsp_input_navigation_key_t key, bool state) {
     bsp_input_event_t event = {
         .type                      = INPUT_EVENT_TYPE_NAVIGATION,
@@ -63,10 +75,26 @@ static void step(int* travelled, int unit, bsp_input_navigation_key_t forward,
 }
 
 void hid_mouse_disconnect(void) {
+    // A button that was held when the mouse went away is never released by a report, so let go of
+    // it here. Leaving it down would have the launcher acting on a key nobody is pressing.
+    for (uint16_t b = 0; b < BUTTON_KEY_COUNT; b++) {
+        if (prev_buttons & (1u << b)) {
+            inject_navigation(button_keys[b], false);
+        }
+    }
+
+    prev_buttons = 0;
+    travelled_x  = 0;
+    travelled_y  = 0;
+    detent       = 1;
+    scrolled     = 0;
+
     memset(&layout, 0, sizeof(layout));
 }
 
 bool hid_mouse_connect(const uint8_t* report_descriptor, size_t length) {
+    hid_mouse_disconnect();
+
     if (!hid_layout_parse(report_descriptor, length, &layout)) {
         ESP_LOGW(TAG, "Nothing usable in the report descriptor, ignoring this mouse");
         return false;
@@ -81,16 +109,6 @@ bool hid_mouse_connect(const uint8_t* report_descriptor, size_t length) {
 }
 
 void hid_mouse_handle_report(const uint8_t* data, int length) {
-    static uint32_t prev_buttons = 0;
-    static int      travelled_x  = 0;
-    static int      travelled_y  = 0;
-
-    // A plain wheel reports one count per detent, a wheel with a resolution multiplier reports
-    // eight or more. Take the largest count seen so far as one detent, so the first turn of an
-    // unknown wheel moves one place and the wheel calibrates itself from there.
-    static int detent    = 1;
-    static int scrolled  = 0;
-
     if (!layout.valid || !hid_layout_strip_report_id(&layout, &data, &length)) {
         return;
     }

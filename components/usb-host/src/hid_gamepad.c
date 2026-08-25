@@ -73,6 +73,11 @@ static hid_gamepad_t                     gamepad;
 static const bsp_input_navigation_key_t* button_map;
 static size_t                            button_map_length;
 
+// What the last report said, so only changes are sent on. Which navigation key each bit stands
+// for is kept alongside it, since a gamepad that unplugs while a key is held has to release it.
+static uint32_t                   prev_state;
+static bsp_input_navigation_key_t prev_keys[NAVIGATION_KEY_COUNT];
+
 static void inject_navigation(bsp_input_navigation_key_t key, bool state) {
     bsp_input_event_t event = {
         .type                      = INPUT_EVENT_TYPE_NAVIGATION,
@@ -84,6 +89,15 @@ static void inject_navigation(bsp_input_navigation_key_t key, bool state) {
 }
 
 void hid_gamepad_disconnect(void) {
+    // A key that was held when the gamepad went away is never released by a report, so let go of
+    // it here. Leaving it down would have the launcher scrolling on by itself.
+    for (size_t i = 0; i < NAVIGATION_KEY_COUNT; i++) {
+        if (prev_state & ((uint32_t)1 << i)) {
+            inject_navigation(prev_keys[i], false);
+        }
+    }
+    prev_state = 0;
+
     hid_gamepad_close(&gamepad);
     button_map        = NULL;
     button_map_length = 0;
@@ -152,18 +166,18 @@ void hid_gamepad_handle_report(const uint8_t* data, int length) {
     }
 
     // Only send events on state changes, gamepads report their full state continuously
-    static uint32_t prev_state = 0;
-    uint32_t        state      = 0;
+    uint32_t state = 0;
 
     for (size_t i = 0; i < NAVIGATION_KEY_COUNT; i++) {
         if (states[i]) {
-            state |= (1 << i);
+            state |= (uint32_t)1 << i;
         }
-        bool was = prev_state & (1 << i);
+        bool was = (prev_state & ((uint32_t)1 << i)) != 0;
         if (was != states[i]) {
             inject_navigation(keys[i], states[i]);
             ESP_LOGD(TAG, "Navigation key %d = %d", keys[i], states[i]);
         }
+        prev_keys[i] = keys[i];
     }
 
     prev_state = state;
